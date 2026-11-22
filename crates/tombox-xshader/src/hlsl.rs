@@ -1918,7 +1918,7 @@ impl<'a> Emitter<'a> {
             // PSV0 tells typed (6) from structured (8) UAVs. Atomics need a uint element, so
             // a typed UAV used atomically is declared RWBuffer<uint>.
             let (reg, space) = (slot & 0xffff, slot >> 16);
-            let structured = slot & BINDLESS != 0 || self.ex.resources.iter().any(|p| p.res_type == 8 && p.space == space && p.lower <= reg && reg <= p.upper);
+            let structured = slot & BINDLESS != 0 || self.ex.resources.iter().any(|p| matches!(p.res_type, 7 | 8 | 9) && p.space == space && p.lower <= reg && reg <= p.upper);
             if structured {
                 let e = self.sbuf.entry((true, slot)).or_insert(0);
                 *e = (*e).max(ins.aux.imm as u32 / 4 + 1);

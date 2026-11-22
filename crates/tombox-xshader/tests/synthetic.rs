@@ -5,7 +5,7 @@
 //! wrapped in a `ShaderExtract` with a made-up signature.
 
 use tombox_xshader::hlsl::translate;
-use tombox_xshader::meta::{GsInfo, MeshInfo, RootParam, RootParamKind, RootRange, RootSig, SigElement};
+use tombox_xshader::meta::{GsInfo, MeshInfo, PsvResource, RootParam, RootParamKind, RootRange, RootSig, SigElement};
 use tombox_xshader::{parse_root_signature, ShaderExtract, Stage};
 
 const S_ENDPGM: u32 = 0xbf81_0000;
@@ -684,4 +684,36 @@ fn d16_texel_type_looks_through_half_packing() {
         Err(e) => e,
     };
     assert!(err.contains("atomic"), "{err}");
+}
+
+#[test]
+fn raw_uav_buffer_atomics_share_ubuf_instead_of_overlapping_utb() {
+    let words = [
+        0xf408_0002, 0xfa00_0000,
+        0x7e02_0284,
+        0x7e06_0287,
+        0xe070_1000, 0x8000_0301,
+        0xe0e8_1004, 0x8000_0301,
+        S_ENDPGM,
+    ];
+    let root = RootSig {
+        version: 2,
+        flags: 0,
+        params: vec![table(1, 1, 0)],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    };
+    let mut ex = shader(Stage::Compute, &words, vec![], vec![], Some(root));
+    ex.isa_preamble = [0, 64, 1, 1];
+    (ex.has_input_sig, ex.has_output_sig) = (false, false);
+    ex.has_psv0 = true;
+    ex.resources.push(PsvResource { res_type: 7, space: 0, lower: 0, upper: 0, kind: 1 });
+    let t = translate(&ex).expect("raw UAV buffer store + atomic");
+    assert!(t.hlsl.contains("ubuf0"), "{}", t.hlsl);
+    assert!(!t.hlsl.contains("utb0"), "overlapping utb0 declaration:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("InterlockedOr(ubuf0["), "{}", t.hlsl);
+    if tombox_xshader::dxc::available() {
+        let profile = tombox_xshader::dxc::profile_for(t.profile);
+        tombox_xshader::dxc::compile(&t.hlsl, &profile).expect("DXC compile");
+    }
 }
