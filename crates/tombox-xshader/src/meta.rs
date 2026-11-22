@@ -36,7 +36,7 @@ pub fn parse_signature(tag: &[u8; 4], body: &[u8]) -> Result<Vec<SigElement>, St
     if count > 64 {
         return Err(format!("implausible signature element count {count}"));
     }
-    let is_24 = matches!(tag, b"ISGN" | b"OSGN" | b"PCSG");
+    let is_24 = matches!(tag, b"ISGN" | b"OSGN" | b"PCSG" | b"PSGN");
     let stride = if is_24 { 24 } else { 32 };
     if 8 + count * stride > body.len() {
         return Err(format!("signature body truncated for {count} elements"));
@@ -108,9 +108,14 @@ pub struct MeshInfo {
 }
 
 pub(crate) fn mesh_thread_count(dims: [u32; 3]) -> Result<u32, String> {
+    mesh_thread_count_for(14, dims)
+}
+
+pub(crate) fn mesh_thread_count_for(stage: u8, dims: [u32; 3]) -> Result<u32, String> {
     let count = dims.into_iter().try_fold(1u32, u32::checked_mul);
     match count {
         Some(n @ 1..=128) => Ok(n),
+        Some(n @ 129..=256) if stage == 13 && n % 2 == 0 => Ok(n),
         _ => Err(format!("mesh/amplification thread-group size {dims:?} outside 1..128")),
     }
 }

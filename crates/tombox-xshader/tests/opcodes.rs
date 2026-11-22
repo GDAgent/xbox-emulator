@@ -69,6 +69,7 @@ fn shader(words: &[u32], root: Option<RootSig>) -> ShaderExtract {
         has_root_sig: root.is_some(),
         input_sig: vec![],
         output_sig: vec![sig("SV_Target", 64, 3, 0, 0xf)],
+        prim_sig: Vec::new(),
         resources: Vec::new(),
         gs_info: None,
         root_sig: root,

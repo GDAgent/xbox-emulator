@@ -188,6 +188,7 @@ pub struct ShaderExtract {
     /// Parsed D3D-side metadata (empty/None when the chunk is absent or malformed).
     pub input_sig: Vec<meta::SigElement>,
     pub output_sig: Vec<meta::SigElement>,
+    pub prim_sig: Vec<meta::SigElement>,
     pub resources: Vec<meta::PsvResource>,
     /// Geometry-shader info from PSV0 (only meaningful for `Stage::Geometry`).
     pub gs_info: Option<meta::GsInfo>,
@@ -305,6 +306,9 @@ pub fn extract(dxbc: &[u8]) -> Result<ShaderExtract, String> {
             .unwrap_or_default(),
         output_sig: chunk_body(b"OSG1").and_then(|b| meta::parse_signature(b"OSG1", b).ok())
             .or_else(|| chunk_body(b"OSGN").and_then(|b| meta::parse_signature(b"OSGN", b).ok()))
+            .unwrap_or_default(),
+        prim_sig: chunk_body(b"PSG1").and_then(|b| meta::parse_signature(b"PSG1", b).ok())
+            .or_else(|| chunk_body(b"PSGN").and_then(|b| meta::parse_signature(b"PSGN", b).ok()))
             .unwrap_or_default(),
         resources: chunk_body(b"PSV0").and_then(|b| meta::parse_psv0(b).ok()).unwrap_or_default(),
         gs_info,

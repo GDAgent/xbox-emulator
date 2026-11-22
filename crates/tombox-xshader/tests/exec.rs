@@ -146,6 +146,7 @@ pub fn shader(words: &[u32]) -> ShaderExtract {
         has_root_sig: false,
         input_sig: vec![],
         output_sig: vec![sig("SV_Target", 64, 1, 0, 0xf)],
+        prim_sig: Vec::new(),
         resources: Vec::new(),
         gs_info: None,
         root_sig: None,
