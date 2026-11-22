@@ -9,8 +9,10 @@ pub const SUB_ROOT_SIGNATURE: u32 = 0;
 pub const SUB_VS: u32 = 1;
 pub const SUB_PS: u32 = 2;
 pub const SUB_DS: u32 = 3;
+pub const SUB_HS: u32 = 4;
 pub const SUB_GS: u32 = 5;
 pub const SUB_CS: u32 = 6;
+pub const SUB_PRIMITIVE_TOPOLOGY: u32 = 14;
 pub const SUB_AS: u32 = 24;
 pub const SUB_MS: u32 = 25;
 pub const PC_DEVICE2_CREATE_PIPELINE_STATE: usize = 47;
@@ -113,6 +115,47 @@ pub fn stage_rtfmt(ty: u32, (n, f): (u32, [u32; 8])) -> [u8; 8] {
     if ty == SUB_PS { crate::shader_xlat::export_formats(n, &f) } else { [0; 8] }
 }
 
+fn mesh_dxil_topology(dxbc: &[u8]) -> Option<u32> {
+    if dxbc.len() < 32 || &dxbc[0..4] != b"DXBC" {
+        return None;
+    }
+    let count = u32::from_le_bytes(dxbc[28..32].try_into().ok()?) as usize;
+    if 32usize.checked_add(count.checked_mul(4)?)? > dxbc.len() {
+        return None;
+    }
+    for i in 0..count {
+        let off = u32::from_le_bytes(dxbc[32 + i * 4..36 + i * 4].try_into().ok()?) as usize;
+        if off.checked_add(8)? > dxbc.len() || &dxbc[off..off + 4] != b"PSV0" {
+            continue;
+        }
+        let sz = u32::from_le_bytes(dxbc[off + 4..off + 8].try_into().ok()?) as usize;
+        let body = dxbc.get(off + 8..off + 8 + sz)?;
+        let info_sz = u32::from_le_bytes(body.get(0..4)?.try_into().ok()?) as usize;
+        let info = body.get(4..4 + info_sz)?;
+        let m = tombox_xshader::meta::parse_psv0_mesh(info)?;
+        return match m.topology {
+            1 => Some(2),
+            2 => Some(3),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn stream_summary(stream: &[u8]) -> String {
+    match parse(stream) {
+        Ok(subs) => subs
+            .iter()
+            .map(|&(ty, inner)| {
+                let w0 = stream.get(inner..inner + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0);
+                format!("{ty}:{w0:#x}")
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Err(e) => format!("parse-err({e})"),
+    }
+}
+
 pub fn translate_stream(stream: &[u8], xlat: &dyn Fn(u32, &[u8], (u32, [u32; 8]), Option<&[u8]>) -> Result<Arc<Vec<u8>>, String>) -> Result<(Vec<u8>, Vec<Arc<Vec<u8>>>), String> {
     let subs = parse(stream)?;
     validate(stream, &subs)?;
@@ -120,9 +163,29 @@ pub fn translate_stream(stream: &[u8], xlat: &dyn Fn(u32, &[u8], (u32, [u32; 8])
     let code_of = |t: u32| subs.iter().find(|(x, _)| *x == t).map(|(_, o)| bytecode(stream, *o)).filter(|(p, n)| *p != 0 && *n != 0);
     let feeder = [SUB_MS, SUB_GS, SUB_DS, SUB_VS].into_iter().find(|&t| code_of(t).is_some());
     let ps = code_of(SUB_PS).map(|(p, n)| unsafe { core::slice::from_raw_parts(p as *const u8, n as usize) });
-    let mut out = stream.to_vec();
+    let has_ms = code_of(SUB_MS).is_some();
+    let mut ms_topo = code_of(SUB_MS).and_then(|(p, n)| mesh_dxil_topology(unsafe { core::slice::from_raw_parts(p as *const u8, n as usize) }));
+    let mut out = Vec::with_capacity(stream.len() + 8);
     let mut keep = Vec::new();
+    let mut topo_dst: Option<usize> = None;
     for &(ty, inner) in &subs {
+        let (a, n) = inner_layout(ty).unwrap();
+        let start = inner - align(4, a);
+        let end = align(inner + n, 8).min(stream.len());
+        if has_ms && matches!(ty, SUB_VS | SUB_DS | SUB_HS | SUB_GS) {
+            let (p, blen) = bytecode(stream, inner);
+            if p == 0 || blen == 0 {
+                continue;
+            }
+        }
+        if has_ms && ty == SUB_PRIMITIVE_TOPOLOGY {
+            if ms_topo.is_none() {
+                continue;
+            }
+            topo_dst = Some(out.len() + (inner - start));
+        }
+        let base = out.len();
+        out.extend_from_slice(&stream[start..end]);
         if !matches!(ty, 1..=6 | SUB_AS | SUB_MS) {
             continue;
         }
@@ -133,9 +196,26 @@ pub fn translate_stream(stream: &[u8], xlat: &dyn Fn(u32, &[u8], (u32, [u32; 8])
         let blob = unsafe { core::slice::from_raw_parts(p as *const u8, n as usize) };
         let feeds = if Some(ty) == feeder { ps } else { None };
         let code = xlat(ty, blob, rts, feeds).map_err(|e| format!("subobject {ty}: {e}"))?;
-        out[inner..inner + 8].copy_from_slice(&(code.as_ptr() as u64).to_le_bytes());
-        out[inner + 8..inner + 16].copy_from_slice(&(code.len() as u64).to_le_bytes());
+        if ty == SUB_MS && ms_topo.is_none() {
+            ms_topo = mesh_dxil_topology(&code);
+        }
+        let dst = base + (inner - start);
+        out[dst..dst + 8].copy_from_slice(&(code.as_ptr() as u64).to_le_bytes());
+        out[dst + 8..dst + 16].copy_from_slice(&(code.len() as u64).to_le_bytes());
         keep.push(code);
+    }
+    if has_ms {
+        if let Some(t) = ms_topo {
+            if let Some(off) = topo_dst {
+                out[off..off + 4].copy_from_slice(&t.to_le_bytes());
+            } else {
+                while out.len() % 8 != 0 {
+                    out.push(0);
+                }
+                out.extend_from_slice(&SUB_PRIMITIVE_TOPOLOGY.to_le_bytes());
+                out.extend_from_slice(&t.to_le_bytes());
+            }
+        }
     }
     Ok((out, keep))
 }
@@ -185,6 +265,9 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     let f: unsafe extern "system" fn(*mut c_void, *const [u64; 2], *const c_void, *mut *mut c_void) -> i32 = core::mem::transmute(*vt2.add(PC_DEVICE2_CREATE_PIPELINE_STATE));
     let d = [out.len() as u64, out.as_ptr() as u64];
     let hr = f(dev2, &d, riid, ppv);
+    if hr < 0 {
+        record("d3d12_xs", "CreatePipelineState", &format!("PC driver rejected stream hr={hr:#010x} subs=[{}]", stream_summary(&out)));
+    }
     if hr >= 0 && !(*ppv).is_null() && parse(stream).is_ok_and(|s| s.iter().any(|(t, o)| *t == SUB_AS && bytecode(stream, *o).0 != 0)) {
         crate::console_slots_mesh::note_as_pso(*ppv as usize);
     }
@@ -367,6 +450,89 @@ mod tests {
         push(&mut s, SUB_AS, &bc(&b));
         push(&mut s, SUB_MS, &bc(&b));
         assert!(as_root_rule(&s, &parse(&s).unwrap(), &known).unwrap_err().contains("embeds none"));
+    }
+
+    fn fake_mesh_dxbc(psv_topology: u8) -> Vec<u8> {
+        let mut info = [0u8; 48];
+        info[24] = 13;
+        info[27] = psv_topology;
+        let chunk_sz = 4u32 + info.len() as u32;
+        let total = 36u32 + 8 + chunk_sz;
+        let mut b = Vec::with_capacity(total as usize);
+        b.extend_from_slice(b"DXBC");
+        b.extend_from_slice(&[0u8; 16]);
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&total.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&36u32.to_le_bytes());
+        b.extend_from_slice(b"PSV0");
+        b.extend_from_slice(&chunk_sz.to_le_bytes());
+        b.extend_from_slice(&(info.len() as u32).to_le_bytes());
+        b.extend_from_slice(&info);
+        b
+    }
+
+    #[test]
+    fn mesh_stream_sets_primitive_topology_from_psv0_and_drops_empty_legacy_stages() {
+        let ms_in = vec![1u8, 2, 3];
+        let ps = vec![9u8; 5];
+        let ms_tri = fake_mesh_dxbc(2);
+        let ms_line = fake_mesh_dxbc(1);
+
+        let xl_tri = |ty: u32, b: &[u8], _: (u32, [u32; 8]), _: Option<&[u8]>| {
+            Ok(Arc::new(if ty == SUB_MS { ms_tri.clone() } else { b.to_vec() }))
+        };
+        let mut s_before = Vec::new();
+        push(&mut s_before, SUB_PRIMITIVE_TOPOLOGY, &0u32.to_le_bytes());
+        push(&mut s_before, SUB_VS, &[0u8; 16]);
+        push(&mut s_before, SUB_HS, &[0u8; 16]);
+        push(&mut s_before, SUB_DS, &[0u8; 16]);
+        push(&mut s_before, SUB_GS, &[0u8; 16]);
+        push(&mut s_before, SUB_MS, &bc(&ms_in));
+        push(&mut s_before, SUB_PS, &bc(&ps));
+        let (out_before, keep_before) = translate_stream(&s_before, &xl_tri).unwrap();
+        let subs_before = parse(&out_before).unwrap();
+        assert_eq!(subs_before, vec![(SUB_MS, 8), (SUB_PS, 32), (SUB_PRIMITIVE_TOPOLOGY, 52)]);
+        assert_eq!(u32::from_le_bytes(out_before[52..56].try_into().unwrap()), 3);
+        assert_eq!(keep_before.len(), 2);
+
+        let xl_line = |ty: u32, b: &[u8], _: (u32, [u32; 8]), _: Option<&[u8]>| {
+            Ok(Arc::new(if ty == SUB_MS { ms_line.clone() } else { b.to_vec() }))
+        };
+        let mut s_after = Vec::new();
+        push(&mut s_after, SUB_MS, &bc(&ms_in));
+        push(&mut s_after, SUB_PRIMITIVE_TOPOLOGY, &0u32.to_le_bytes());
+        push(&mut s_after, SUB_PS, &bc(&ps));
+        let (out_after, _) = translate_stream(&s_after, &xl_line).unwrap();
+        let subs_after = parse(&out_after).unwrap();
+        assert_eq!(subs_after, vec![(SUB_MS, 8), (SUB_PRIMITIVE_TOPOLOGY, 28), (SUB_PS, 40)]);
+        assert_eq!(u32::from_le_bytes(out_after[28..32].try_into().unwrap()), 2);
+
+        let mut s_omitted = Vec::new();
+        push(&mut s_omitted, SUB_MS, &bc(&ms_in));
+        push(&mut s_omitted, SUB_PS, &bc(&ps));
+        let (out_omitted, _) = translate_stream(&s_omitted, &xl_tri).unwrap();
+        let subs_omitted = parse(&out_omitted).unwrap();
+        assert_eq!(subs_omitted, vec![(SUB_MS, 8), (SUB_PS, 32), (SUB_PRIMITIVE_TOPOLOGY, 52)]);
+        assert_eq!(u32::from_le_bytes(out_omitted[52..56].try_into().unwrap()), 3);
+
+        let xl_raw = |_: u32, b: &[u8], _: (u32, [u32; 8]), _: Option<&[u8]>| Ok(Arc::new(b.to_vec()));
+        let mut ms_no_psv = Vec::new();
+        push(&mut ms_no_psv, SUB_MS, &bc(&ms_in));
+        push(&mut ms_no_psv, SUB_PRIMITIVE_TOPOLOGY, &0u32.to_le_bytes());
+        push(&mut ms_no_psv, SUB_PS, &bc(&ps));
+        let (out_no_psv, _) = translate_stream(&ms_no_psv, &xl_raw).unwrap();
+        assert_eq!(parse(&out_no_psv).unwrap(), vec![(SUB_MS, 8), (SUB_PS, 32)]);
+
+        let mut vs_stream = Vec::new();
+        push(&mut vs_stream, SUB_VS, &bc(&ms_in));
+        push(&mut vs_stream, SUB_PRIMITIVE_TOPOLOGY, &3u32.to_le_bytes());
+        push(&mut vs_stream, SUB_PS, &bc(&ps));
+        let (out_vs, keep_vs) = translate_stream(&vs_stream, &xl_raw).unwrap();
+        let subs_vs = parse(&out_vs).unwrap();
+        assert_eq!(subs_vs, vec![(SUB_VS, 8), (SUB_PRIMITIVE_TOPOLOGY, 28), (SUB_PS, 40)]);
+        assert_eq!(u32::from_le_bytes(out_vs[28..32].try_into().unwrap()), 3);
+        assert_eq!(keep_vs.len(), 2);
     }
 
     #[test]
