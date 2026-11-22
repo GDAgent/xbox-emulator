@@ -15,6 +15,9 @@ pub const SUB_CS: u32 = 6;
 pub const SUB_PRIMITIVE_TOPOLOGY: u32 = 14;
 pub const SUB_AS: u32 = 24;
 pub const SUB_MS: u32 = 25;
+pub const XBOX_SUB_AS: u32 = 23;
+pub const XBOX_SUB_MS: u32 = 24;
+pub const XBOX_SUB_MAX: u32 = 30;
 pub const PC_DEVICE2_CREATE_PIPELINE_STATE: usize = 47;
 pub const PC_LIST6_DISPATCH_MESH: usize = 79;
 
@@ -43,6 +46,158 @@ pub fn inner_layout(ty: u32) -> Option<(usize, usize)> {
 
 fn align(x: usize, a: usize) -> usize {
     (x + a - 1) & !(a - 1)
+}
+
+pub fn xbox_record_size(ty: u32) -> Option<usize> {
+    match ty {
+        0..=22 => inner_layout(ty).map(|(a, n)| align(align(4, a) + n, 8)),
+        XBOX_SUB_AS | XBOX_SUB_MS => Some(24),
+        25 => Some(40),
+        26 | 29 => Some(32),
+        27 => Some(64),
+        28 | 30 => Some(16),
+        _ => None,
+    }
+}
+
+fn note_xbox_ext(ty: u32, payload: &[u8]) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, Vec<u8>)>>> = Mutex::new(None);
+    let key = (ty, payload.to_vec());
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = g.get_or_insert_with(HashSet::new);
+    if set.len() < 32 && set.insert(key) {
+        let words: Vec<String> = payload
+            .chunks(4)
+            .take(16)
+            .map(|c| {
+                let mut b = [0u8; 4];
+                b[..c.len()].copy_from_slice(c);
+                format!("{:#x}", u32::from_le_bytes(b))
+            })
+            .collect();
+        record(
+            "d3d12_xs",
+            "CreatePipelineState",
+            &format!("Xbox-only pipeline subobject {ty} ({}B record, no PC equivalent) dropped from PC stream; payload words [{}]", payload.len() + 4, words.join(", ")),
+        );
+    }
+}
+
+fn note_raw_stream(types: &[u32], mode: &str) {
+    static LOGGED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let n = LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 8 {
+        record(
+            "d3d12_xs",
+            "CreatePipelineState",
+            &format!("console stream PSO #{} raw subobjects {types:?} ({mode})", n + 1),
+        );
+    }
+}
+
+fn scan_records(stream: &[u8], sub25_size: usize, allow_xbox_only: bool) -> Result<Vec<(u32, usize, usize)>, String> {
+    let mut recs = Vec::new();
+    let mut seen = [false; (XBOX_SUB_MAX as usize) + 1];
+    let mut at = 0usize;
+    while at < stream.len() {
+        let ty = u32::from_le_bytes(stream.get(at..at + 4).ok_or("truncated subobject type")?.try_into().unwrap());
+        let sz = match ty {
+            0..=22 => xbox_record_size(ty),
+            24 => Some(24),
+            25 => Some(sub25_size),
+            23 | 26..=30 if allow_xbox_only => xbox_record_size(ty),
+            _ => None,
+        };
+        let Some(sz) = sz else {
+            let tail = &stream[at..stream.len().min(at + 96)];
+            let words: Vec<String> = tail.chunks(4).map(|c| c.iter().rev().map(|b| format!("{b:02x}")).collect()).collect();
+            return Err(format!("Xbox pipeline subobject type {ty} at {at:#x} unsupported (stream {} bytes; next words {})", stream.len(), words.join(" ")));
+        };
+        if at + sz > stream.len() {
+            return Err(format!("Xbox pipeline subobject type {ty} at {at:#x} runs past the stream end"));
+        }
+        let dup_slot = if ty == 21 { 11 } else { ty as usize };
+        if seen[dup_slot] {
+            return Err(format!("Xbox pipeline subobject type {ty} appears twice"));
+        }
+        seen[dup_slot] = true;
+        recs.push((ty, at, sz));
+        at += sz;
+    }
+    Ok(recs)
+}
+
+fn remap_console_records(stream: &[u8], recs: &[(u32, usize, usize)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(stream.len());
+    for &(ty, at, sz) in recs {
+        match ty {
+            0..=22 => out.extend_from_slice(&stream[at..at + sz]),
+            XBOX_SUB_AS | XBOX_SUB_MS => {
+                let (p, n) = bytecode(stream, at + 8);
+                if p != 0 || n != 0 {
+                    let pc_ty = if ty == XBOX_SUB_AS { SUB_AS } else { SUB_MS };
+                    out.extend_from_slice(&pc_ty.to_le_bytes());
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                    out.extend_from_slice(&stream[at + 8..at + 24]);
+                }
+            }
+            26..=30 => note_xbox_ext(ty, &stream[at + 4..at + sz]),
+            _ => unreachable!(),
+        }
+    }
+    out
+}
+
+fn xbox_to_pc_stream_inner(stream: &[u8], log_raw: bool) -> Result<Vec<u8>, String> {
+    if let Ok(recs) = scan_records(stream, 24, false) {
+        let types: Vec<u32> = recs.iter().map(|r| r.0).collect();
+        let has_24 = types.contains(&24);
+        let has_25 = types.contains(&25);
+        if has_24 && !has_25 {
+            if log_raw {
+                note_raw_stream(&types, "console-remap");
+            }
+            return Ok(remap_console_records(stream, &recs));
+        }
+        if log_raw {
+            note_raw_stream(&types, "passthrough");
+        }
+        return Ok(stream.to_vec());
+    }
+    let xbox_scan = scan_records(stream, 40, true);
+    let recs = match xbox_scan {
+        Ok(r) => r,
+        Err(e) => match scan_records(stream, 24, true) {
+            Ok(r) => r,
+            Err(_) => return Err(e),
+        },
+    };
+    let types: Vec<u32> = recs.iter().map(|r| r.0).collect();
+    let has_23 = types.contains(&23);
+    let has_25 = types.contains(&25);
+    let has_26_30 = types.iter().any(|&t| (26..=30).contains(&t));
+    if has_25 && (has_23 || has_26_30) {
+        if log_raw {
+            note_raw_stream(&types, "ambiguous-refused");
+        }
+        return Err(format!("ambiguous pipeline stream mixes subobject 25 with console subobjects (types {types:?})"));
+    }
+    if has_25 {
+        if log_raw {
+            note_raw_stream(&types, "ambiguous-refused");
+        }
+        return Err(format!("ambiguous pipeline stream has 40-byte subobject 25 without console-only subobjects (types {types:?})"));
+    }
+    if log_raw {
+        note_raw_stream(&types, "console-remap");
+    }
+    Ok(remap_console_records(stream, &recs))
+}
+
+pub fn xbox_to_pc_stream(stream: &[u8]) -> Result<Vec<u8>, String> {
+    xbox_to_pc_stream_inner(stream, false)
 }
 
 pub fn parse(stream: &[u8]) -> Result<Vec<(u32, usize)>, String> {
@@ -228,7 +383,15 @@ pub unsafe fn create_pipeline_state(real: *mut c_void, desc: *const [u64; 2], ri
     if ptr == 0 || size == 0 {
         return E_INVALIDARG;
     }
-    let stream = core::slice::from_raw_parts(ptr as *const u8, size as usize);
+    let raw = core::slice::from_raw_parts(ptr as *const u8, size as usize);
+    let pc_stream = match xbox_to_pc_stream_inner(raw, true) {
+        Ok(s) => s,
+        Err(e) => {
+            record("d3d12_xs", "CreatePipelineState", &format!("{e} -> E_INVALIDARG"));
+            return E_INVALIDARG;
+        }
+    };
+    let stream = pc_stream.as_slice();
     let rule = parse(stream).and_then(|s| as_root_rule(stream, &s, &|rs| crate::console_slots_mesh::root_flags(rs as usize)));
     if let Err(e) = rule {
         record("d3d12_xs", "CreatePipelineState", &format!("{e} -> E_INVALIDARG"));
@@ -533,6 +696,138 @@ mod tests {
         assert_eq!(subs_vs, vec![(SUB_VS, 8), (SUB_PRIMITIVE_TOPOLOGY, 28), (SUB_PS, 40)]);
         assert_eq!(u32::from_le_bytes(out_vs[28..32].try_into().unwrap()), 3);
         assert_eq!(keep_vs.len(), 2);
+    }
+
+    #[test]
+    fn xbox_stream_remaps_as_ms_and_drops_console_extensions() {
+        let ms = vec![1u8, 2, 3, 4];
+        let ps = vec![5u8, 6, 7];
+        let mut x = Vec::new();
+        push(&mut x, SUB_ROOT_SIGNATURE, &0x1234u64.to_le_bytes());
+        x.extend_from_slice(&XBOX_SUB_MS.to_le_bytes());
+        x.extend_from_slice(&0u32.to_le_bytes());
+        x.extend_from_slice(&bc(&ms));
+        x.extend_from_slice(&XBOX_SUB_AS.to_le_bytes());
+        x.extend_from_slice(&[0u8; 20]);
+        push(&mut x, SUB_PS, &bc(&ps));
+        let mut ext26 = [0u8; 32];
+        ext26[0..4].copy_from_slice(&26u32.to_le_bytes());
+        ext26[20..24].copy_from_slice(&0xffffu32.to_le_bytes());
+        x.extend_from_slice(&ext26);
+
+        let pc = xbox_to_pc_stream(&x).unwrap();
+        let subs = parse(&pc).unwrap();
+        assert_eq!(subs, vec![(SUB_ROOT_SIGNATURE, 8), (SUB_MS, 24), (SUB_PS, 48)]);
+        assert!(validate(&pc, &subs).is_ok());
+
+        let mut x_as = Vec::new();
+        push(&mut x_as, SUB_ROOT_SIGNATURE, &0x10u64.to_le_bytes());
+        x_as.extend_from_slice(&XBOX_SUB_AS.to_le_bytes());
+        x_as.extend_from_slice(&0u32.to_le_bytes());
+        x_as.extend_from_slice(&bc(&ms));
+        x_as.extend_from_slice(&XBOX_SUB_MS.to_le_bytes());
+        x_as.extend_from_slice(&0u32.to_le_bytes());
+        x_as.extend_from_slice(&bc(&ps));
+        let pc_as = xbox_to_pc_stream(&x_as).unwrap();
+        let subs_as = parse(&pc_as).unwrap();
+        assert_eq!(subs_as, vec![(SUB_ROOT_SIGNATURE, 8), (SUB_AS, 24), (SUB_MS, 48)]);
+        assert!(validate(&pc_as, &subs_as).is_ok());
+
+        let mut x_ms_only = Vec::new();
+        push(&mut x_ms_only, SUB_ROOT_SIGNATURE, &0x20u64.to_le_bytes());
+        x_ms_only.extend_from_slice(&XBOX_SUB_MS.to_le_bytes());
+        x_ms_only.extend_from_slice(&0u32.to_le_bytes());
+        x_ms_only.extend_from_slice(&bc(&ms));
+        push(&mut x_ms_only, SUB_PS, &bc(&ps));
+        let pc_ms_only = xbox_to_pc_stream(&x_ms_only).unwrap();
+        assert_eq!(parse(&pc_ms_only).unwrap(), vec![(SUB_ROOT_SIGNATURE, 8), (SUB_MS, 24), (SUB_PS, 48)]);
+    }
+
+    #[test]
+    fn xbox_stream_passes_through_pc_numbered_and_basic_streams() {
+        let a = vec![1u8, 2, 3, 4];
+        let b = vec![5u8, 6, 7];
+
+        let mut pc_as_ms = Vec::new();
+        push(&mut pc_as_ms, SUB_ROOT_SIGNATURE, &0x10u64.to_le_bytes());
+        push(&mut pc_as_ms, SUB_AS, &bc(&a));
+        push(&mut pc_as_ms, SUB_MS, &bc(&b));
+        push(&mut pc_as_ms, SUB_PS, &bc(&a));
+        let out = xbox_to_pc_stream(&pc_as_ms).unwrap();
+        assert_eq!(out, pc_as_ms);
+        assert_eq!(parse(&out).unwrap(), vec![(SUB_ROOT_SIGNATURE, 8), (SUB_AS, 24), (SUB_MS, 48), (SUB_PS, 72)]);
+
+        let mut basic = Vec::new();
+        push(&mut basic, SUB_ROOT_SIGNATURE, &0x10u64.to_le_bytes());
+        push(&mut basic, SUB_VS, &bc(&a));
+        push(&mut basic, SUB_PS, &bc(&b));
+        push(&mut basic, 17, &[1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(xbox_to_pc_stream(&basic).unwrap(), basic);
+
+        let mut pc_ms_only = Vec::new();
+        push(&mut pc_ms_only, SUB_ROOT_SIGNATURE, &0x10u64.to_le_bytes());
+        push(&mut pc_ms_only, SUB_MS, &bc(&b));
+        push(&mut pc_ms_only, SUB_PS, &bc(&a));
+        assert_eq!(xbox_to_pc_stream(&pc_ms_only).unwrap(), pc_ms_only);
+    }
+
+    #[test]
+    fn xbox_stream_refuses_ambiguous_subobject_25_mixes() {
+        let a = vec![1u8, 2, 3, 4];
+
+        let mut ext25_and_26 = Vec::new();
+        let mut r25 = [0u8; 40];
+        r25[0..4].copy_from_slice(&25u32.to_le_bytes());
+        let mut r26 = [0u8; 32];
+        r26[0..4].copy_from_slice(&26u32.to_le_bytes());
+        ext25_and_26.extend_from_slice(&r25);
+        ext25_and_26.extend_from_slice(&r26);
+        assert!(xbox_to_pc_stream(&ext25_and_26).unwrap_err().contains("ambiguous"));
+
+        let mut x23_and_x25 = Vec::new();
+        x23_and_x25.extend_from_slice(&XBOX_SUB_AS.to_le_bytes());
+        x23_and_x25.extend_from_slice(&0u32.to_le_bytes());
+        x23_and_x25.extend_from_slice(&bc(&a));
+        x23_and_x25.extend_from_slice(&r25);
+        assert!(xbox_to_pc_stream(&x23_and_x25).unwrap_err().contains("ambiguous"));
+
+        let mut x23_and_pc25 = Vec::new();
+        x23_and_pc25.extend_from_slice(&XBOX_SUB_AS.to_le_bytes());
+        x23_and_pc25.extend_from_slice(&0u32.to_le_bytes());
+        x23_and_pc25.extend_from_slice(&bc(&a));
+        push(&mut x23_and_pc25, SUB_MS, &bc(&a));
+        assert!(xbox_to_pc_stream(&x23_and_pc25).unwrap_err().contains("ambiguous"));
+    }
+
+    #[test]
+    fn xbox_stream_handles_all_extension_sizes_and_rejects_bad_streams() {
+        for (ty, sz) in [(23u32, 24usize), (24, 24), (25, 40), (26, 32), (27, 64), (28, 16), (29, 32), (30, 16)] {
+            assert_eq!(xbox_record_size(ty), Some(sz));
+        }
+        assert_eq!(xbox_record_size(31), None);
+
+        let mut x = Vec::new();
+        for (ty, sz) in [(26u32, 32usize), (27, 64), (28, 16), (29, 32), (30, 16)] {
+            let mut rec = vec![0u8; sz];
+            rec[0..4].copy_from_slice(&ty.to_le_bytes());
+            x.extend_from_slice(&rec);
+        }
+        push(&mut x, 17, &[1, 0, 0, 0, 0, 0, 0, 0]);
+        let pc = xbox_to_pc_stream(&x).unwrap();
+        assert_eq!(parse(&pc).unwrap(), vec![(17, 4)]);
+
+        let mut dup = Vec::new();
+        push(&mut dup, 11, &[0u8; 52]);
+        push(&mut dup, 21, &[0u8; 56]);
+        assert!(xbox_to_pc_stream(&dup).unwrap_err().contains("twice"));
+
+        let mut unk = 31u32.to_le_bytes().to_vec();
+        unk.extend_from_slice(&[0u8; 12]);
+        assert!(xbox_to_pc_stream(&unk).unwrap_err().contains("type 31 at 0x0 unsupported"));
+
+        let mut short = vec![0u8; 20];
+        short[0..4].copy_from_slice(&26u32.to_le_bytes());
+        assert!(xbox_to_pc_stream(&short).unwrap_err().contains("past the stream end"));
     }
 
     #[test]
