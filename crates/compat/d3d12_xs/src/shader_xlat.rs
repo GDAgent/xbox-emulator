@@ -27,10 +27,26 @@ static TYPED_ATOMIC64: AtomicI32 = AtomicI32::new(-1);
 const FEATURE_SHADER_MODEL: u32 = 7;
 const FEATURE_OPTIONS9: u32 = 37;
 const SHADER_MODEL_6_6: u32 = 0x66;
+const IID_D3D12_DEVICE: crate::device_wrap::Guid = crate::device_wrap::Guid { d1: 0x1898_19f1, d2: 0x1db6, d3: 0x4b57, d4: [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7] };
 
-pub(crate) unsafe fn query_typed_atomic64(real_device: *mut c_void) -> (bool, i32, u32, u32) {
-    if real_device.is_null() {
-        return (false, -1, 0, 0);
+unsafe fn is_d3d12_device(obj: *mut c_void) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let vt = *(obj as *const *const usize);
+    let qi: unsafe extern "system" fn(*mut c_void, *const crate::device_wrap::Guid, *mut *mut c_void) -> i32 = core::mem::transmute(*vt);
+    let mut dev: *mut c_void = core::ptr::null_mut();
+    if qi(obj, &IID_D3D12_DEVICE, &mut dev) < 0 || dev.is_null() {
+        return false;
+    }
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 = core::mem::transmute(*(*(dev as *const *const usize)).add(2));
+    release(dev);
+    true
+}
+
+pub(crate) unsafe fn query_typed_atomic64(real_device: *mut c_void) -> Option<(bool, i32, u32, u32)> {
+    if !is_d3d12_device(real_device) {
+        return None;
     }
     let vt = *(real_device as *const *const usize);
     let check: unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32 = core::mem::transmute(*vt.add(13));
@@ -39,11 +55,13 @@ pub(crate) unsafe fn query_typed_atomic64(real_device: *mut c_void) -> (bool, i3
     let mut sm = [SHADER_MODEL_6_6];
     let hr_sm = check(real_device, FEATURE_SHADER_MODEL, sm.as_mut_ptr() as *mut c_void, 4);
     let ok = hr9 >= 0 && o9[2] != 0 && hr_sm >= 0 && sm[0] >= SHADER_MODEL_6_6;
-    (ok, hr9, o9[2], if hr_sm >= 0 { sm[0] } else { 0 })
+    Some((ok, hr9, o9[2], if hr_sm >= 0 { sm[0] } else { 0 }))
 }
 
 pub(crate) unsafe fn probe_typed_atomic64(real_device: *mut c_void) {
-    let (ok, hr9, flag, sm) = query_typed_atomic64(real_device);
+    let Some((ok, hr9, flag, sm)) = query_typed_atomic64(real_device) else {
+        return;
+    };
     let prev = TYPED_ATOMIC64.swap(ok as i32, Ordering::Relaxed);
     if prev != ok as i32 {
         record(
@@ -1086,11 +1104,41 @@ mod tests {
         let mut dev: *mut c_void = core::ptr::null_mut();
         let hr = unsafe { f(core::ptr::null_mut(), 0xc000, &iid, &mut dev) };
         assert!(hr >= 0 && !dev.is_null(), "D3D12CreateDevice hr={hr:#010x}");
-        let (ok, hr9, flag, sm) = unsafe { query_typed_atomic64(dev) };
+        let (ok, hr9, flag, sm) = unsafe { query_typed_atomic64(dev) }.expect("a D3D12 device answers IID_ID3D12Device");
         assert!(hr9 >= 0, "CheckFeatureSupport(OPTIONS9) hr={hr9:#010x}");
         assert_eq!(ok, flag != 0 && sm >= SHADER_MODEL_6_6);
         let rel: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(*(*(dev as *const *const usize)).add(2)) };
         unsafe { rel(dev) };
+    }
+
+    static SHORT_QI: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "system" fn short_qi_refuse(_t: *mut c_void, _g: *const crate::device_wrap::Guid, _p: *mut *mut c_void) -> i32 {
+        SHORT_QI.fetch_add(1, Ordering::SeqCst);
+        0x8000_4002u32 as i32
+    }
+    unsafe extern "system" fn short_qi_null(_t: *mut c_void, _g: *const crate::device_wrap::Guid, p: *mut *mut c_void) -> i32 {
+        SHORT_QI.fetch_add(1, Ordering::SeqCst);
+        unsafe { *p = core::ptr::null_mut() };
+        0
+    }
+    unsafe extern "system" fn short_ref(_t: *mut c_void) -> u32 {
+        1
+    }
+
+    #[test]
+    fn typed_atomic64_probe_skips_objects_that_are_not_d3d12_devices() {
+        for qi in [short_qi_refuse as usize, short_qi_null as usize] {
+            let vt: &'static [usize; 3] = Box::leak(Box::new([qi, short_ref as usize, short_ref as usize]));
+            let p = Box::leak(Box::new(vt.as_ptr())) as *mut *const usize as *mut c_void;
+            let before = SHORT_QI.load(Ordering::SeqCst);
+            assert_eq!(unsafe { query_typed_atomic64(p) }, None);
+            unsafe { probe_typed_atomic64(p) };
+            let w = crate::device_wrap::wrap_device(p);
+            assert!(!w.is_null());
+            assert_eq!(SHORT_QI.load(Ordering::SeqCst) - before, 3);
+        }
+        assert_eq!(unsafe { query_typed_atomic64(core::ptr::null_mut()) }, None);
     }
 }
 
