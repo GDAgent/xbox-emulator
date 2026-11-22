@@ -122,6 +122,43 @@ fn ds_lds_compute() {
             cs.push(cc("ds_write_b16", w, b.clone(), &[10], &move |t| vec![f(dv(nb(t)))]));
             cs.push(cc(m, r, b, &[10], &move |t| vec![f(dv(nb(t)))]));
         }
+        type Ext = fn(u32) -> u32;
+        let w8 = ds(0x1e, off, 0, 2, 0, 0);
+        let w16 = ds(0x1f, off & !1, 8, 2, 0, 0);
+        let d16: [(&'static str, u32, bool, Ext); 6] = [
+            ("ds_read_u8_d16", 0xa2, false, |x| x & 0xff),
+            ("ds_read_u8_d16_hi", 0xa3, true, |x| x & 0xff),
+            ("ds_read_i8_d16", 0xa4, false, |x| (x as u8 as i8) as i16 as u16 as u32),
+            ("ds_read_i8_d16_hi", 0xa5, true, |x| (x as u8 as i8) as i16 as u16 as u32),
+            ("ds_read_u16_d16", 0xa6, false, |x| x & 0xffff),
+            ("ds_read_u16_d16_hi", 0xa7, true, |x| x & 0xffff),
+        ];
+        for (m, op, hi, f) in d16 {
+            let wide = op >= 0xa6;
+            let (w, raddr, roff) = if wide { (w16, 9, off & !1) } else { (w8, 7, off) };
+            let r = ds(op, roff, raddr, 0, 0, 10);
+            let mut b = w.to_vec();
+            b.push(vop1(1, 10, v(4)));
+            b.extend_from_slice(&r);
+            cs.push(cc(m, r, b, &[10], &move |t| {
+                let (old, x) = (ev(t), f(dv(nb(t))));
+                vec![if hi { (old & 0xffff) | (x << 16) } else { (old & 0xffff_0000) | x }]
+            }));
+        }
+        for byte in 0..4u32 {
+            let at = (off & !3) + byte;
+            let w_init = ds(0x0d, off & !3, 1, 4, 0, 0);
+            let w_hi = ds(0xa0, at, 1, 2, 0, 0);
+            let r_full = ds(0x36, off & !3, 3, 0, 0, 10);
+            let mut b = w_init.to_vec();
+            b.extend_from_slice(&w_hi);
+            b.extend_from_slice(&r_full);
+            let sh = byte * 8;
+            cs.push(cc("ds_write_b8_d16_hi", w_hi, b, &[10], &move |t| {
+                let n = nb(t);
+                vec![(ev(n) & !(0xffu32 << sh)) | (((dv(n) >> 16) & 0xff) << sh)]
+            }));
+        }
         let base_off = off & !3;
         for half_off in [base_off, base_off + 2] {
             let w_init = ds(0x0d, base_off, 1, 4, 0, 0);

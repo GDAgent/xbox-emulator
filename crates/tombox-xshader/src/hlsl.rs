@@ -3972,21 +3972,28 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            Enc::Ds if self.is_cs && matches!(m, "ds_write_b16" | "ds_write_b16_d16_hi" | "ds_write_b8" | "ds_read_u16" | "ds_read_i16" | "ds_read_u8" | "ds_read_i8") => {
+            Enc::Ds
+                if self.is_cs
+                    && matches!(
+                        m,
+                        "ds_write_b16" | "ds_write_b16_d16_hi" | "ds_write_b8" | "ds_write_b8_d16_hi" | "ds_read_u16" | "ds_read_i16" | "ds_read_u8" | "ds_read_i8"
+                            | "ds_read_u8_d16" | "ds_read_u8_d16_hi" | "ds_read_i8_d16" | "ds_read_i8_d16_hi" | "ds_read_u16_d16" | "ds_read_u16_d16_hi"
+                    ) =>
+            {
                 // Sub-word accesses to group-shared memory: tb_lds is addressed in dwords, so
                 // read-modify-write the containing dword.
                 self.uses_lds = true;
                 let rd = m.starts_with("ds_read");
                 self.lds_order(!rd, rd);
                 let off = ins.aux.imm as u32 & 0xffff;
-                let bits = if m.contains("16") { 16u32 } else { 8 };
+                let bits = if m.contains("b16") || m.contains("u16") || m.contains("i16") { 16u32 } else { 8 };
                 let mask = (1u32 << bits) - 1;
                 let t = self.tmp;
                 self.tmp += 1;
                 self.line(&format!("uint t{t}a = ({}) + {off:#x}u; uint t{t}s = (t{t}a & 3u) * 8u;", r(&s[0])?));
                 let word = format!("tb_lds[(t{t}a >> 2) & 8191u]");
                 if m.starts_with("ds_write") {
-                    let data = if m == "ds_write_b16_d16_hi" { format!("(({}) >> 16u)", r(&s[1])?) } else { r(&s[1])? };
+                    let data = if m.ends_with("_d16_hi") { format!("(({}) >> 16u)", r(&s[1])?) } else { r(&s[1])? };
                     self.line(&format!(
                         "if (exec_lo & 1u) {{ uint t{t}o = {word}; [allow_uav_condition] for (uint t{t}i = 0u; t{t}i < 4096u; t{t}i++) {{ uint t{t}p; InterlockedCompareExchange({word}, t{t}o, (t{t}o & ~({mask:#x}u << t{t}s)) | (({data} & {mask:#x}u) << t{t}s), t{t}p); if (t{t}p == t{t}o) break; t{t}o = t{t}p; }} }}"
                     ));
@@ -3994,7 +4001,17 @@ impl<'a> Emitter<'a> {
                 }
                 let v = format!("(({word} >> t{t}s) & {mask:#x}u)");
                 let e = if m.contains("_i") { format!("asuint(asint({v} << {}) >> {})", 32 - bits, 32 - bits) } else { v };
-                return self.wv(&d.ok_or("no dst")?, &e);
+                let dst = d.ok_or("no dst")?;
+                let e = if m.ends_with("_d16_hi") {
+                    self.touch(&dst);
+                    format!("((({}) & 0xffffu) | (({e}) << 16u))", r(&dst)?)
+                } else if m.ends_with("_d16") {
+                    self.touch(&dst);
+                    format!("((({}) & 0xffff0000u) | (({e}) & 0xffffu))", r(&dst)?)
+                } else {
+                    e
+                };
+                return self.wv(&dst, &e);
             }
             Enc::Ds
                 if self.is_cs
