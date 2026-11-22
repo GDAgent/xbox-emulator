@@ -93,6 +93,10 @@ unsafe fn vslot(obj: *mut c_void, i: usize) -> usize {
     unsafe { *(*(obj as *const *const usize)).add(i) }
 }
 
+unsafe fn pc_list_slot(list: *mut c_void, slot: usize) -> usize {
+    unsafe { crate::cmdlist_wrap::pc_method(list, slot) }
+}
+
 unsafe fn release(obj: *mut c_void) {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { core::mem::transmute(vslot(obj, 2)) };
     unsafe { f(obj) };
@@ -754,13 +758,13 @@ unsafe fn pc_depth_bias(list: *mut c_void, v: (f32, f32, f32)) -> bool {
     if !unsafe { has_list9(list) } || unsafe { crate::fill::list_type(list) } == LIST_TYPE_BUNDLE {
         return false;
     }
-    let f: unsafe extern "system" fn(*mut c_void, f32, f32, f32) = unsafe { core::mem::transmute(vslot(list, PC_RS_SET_DEPTH_BIAS)) };
+    let f: unsafe extern "system" fn(*mut c_void, f32, f32, f32) = unsafe { core::mem::transmute(pc_list_slot(list, PC_RS_SET_DEPTH_BIAS)) };
     unsafe { f(list, v.0, v.1, v.2) };
     true
 }
 
 unsafe fn pc_set_pso(list: *mut c_void, pso: usize) {
-    let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { core::mem::transmute(vslot(list, PC_SET_PSO)) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { core::mem::transmute(pc_list_slot(list, PC_SET_PSO)) };
     unsafe { f(list, pso as *mut c_void) };
 }
 
@@ -1126,17 +1130,17 @@ unsafe fn uav_barrier(list: *mut c_void, res: usize) {
     let mut b = [0u8; 32];
     b[0..4].copy_from_slice(&2u32.to_le_bytes());
     b[8..16].copy_from_slice(&(res as u64).to_le_bytes());
-    let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = unsafe { core::mem::transmute(vslot(list, PC_BARRIER)) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const u8) = unsafe { core::mem::transmute(pc_list_slot(list, PC_BARRIER)) };
     unsafe { f(list, 1, b.as_ptr()) };
 }
 
 unsafe fn pc_no_predication(list: *mut c_void) {
-    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = unsafe { core::mem::transmute(vslot(list, PC_SET_PREDICATION)) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u32) = unsafe { core::mem::transmute(pc_list_slot(list, PC_SET_PREDICATION)) };
     unsafe { f(list, core::ptr::null_mut(), 0, 0) };
 }
 
 unsafe fn pc_resolve(list: *mut c_void, heap: usize, ty: u32, index: u32, dst: usize, off: u64) {
-    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64) = unsafe { core::mem::transmute(vslot(list, PC_RESOLVE_QUERY)) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void, u64) = unsafe { core::mem::transmute(pc_list_slot(list, PC_RESOLVE_QUERY)) };
     unsafe { f(list, heap as *mut c_void, ty, index, 1, dst as *mut c_void, off) };
 }
 
@@ -1278,11 +1282,11 @@ pub(crate) fn test_restore(saved: Vec<usize>) {
 unsafe fn accumulate(list: *mut c_void, heap: usize, ty: u32, dst: *mut c_void, plan: &[(u32, u64, u32, u32, Vec<u32>)]) {
     let Some(p) = (unsafe { query_pipe(list) }) else { return };
     let key = crate::list_split::origin_of(list);
-    let cp: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64) = unsafe { core::mem::transmute(vslot(list, PC_COPY_BUFFER)) };
-    let srs: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { core::mem::transmute(vslot(list, PC_SET_CROOT)) };
-    let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = unsafe { core::mem::transmute(vslot(list, PC_SET_CCONSTS)) };
-    let su: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(vslot(list, PC_SET_CUAV)) };
-    let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = unsafe { core::mem::transmute(vslot(list, PC_DISPATCH)) };
+    let cp: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64) = unsafe { core::mem::transmute(pc_list_slot(list, PC_COPY_BUFFER)) };
+    let srs: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { core::mem::transmute(pc_list_slot(list, PC_SET_CROOT)) };
+    let sc: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) = unsafe { core::mem::transmute(pc_list_slot(list, PC_SET_CCONSTS)) };
+    let su: unsafe extern "system" fn(*mut c_void, u32, u64) = unsafe { core::mem::transmute(pc_list_slot(list, PC_SET_CUAV)) };
+    let d: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = unsafe { core::mem::transmute(pc_list_slot(list, PC_DISPATCH)) };
     unsafe {
         pc_no_predication(list);
         for (index, off, words, mode, parts) in plan {
@@ -2321,5 +2325,37 @@ mod tests {
         assert_eq!(vt[94].load(Ordering::Relaxed), w_depth_bias_x as usize);
         assert_eq!(vt[43].load(Ordering::Relaxed), w_v43 as usize);
         assert_eq!(vt[12].load(Ordering::Relaxed), 3012);
+    }
+
+    #[test]
+    fn pc_list_slot_resolves_real_pc_methods_on_wrapped_xbox_command_list() {
+        let dev = unsafe { real_device() };
+        if dev.is_null() {
+            return;
+        }
+        unsafe {
+            let mut alloc = core::ptr::null_mut();
+            if vc!(dev, DEV_CREATE_ALLOCATOR, fn(u32, *const Guid, *mut *mut c_void) -> i32, 0, &IID_ALLOCATOR, &mut alloc) < 0 {
+                return;
+            }
+            let mut list = core::ptr::null_mut();
+            if vc!(dev, 12, fn(u32, u32, *mut c_void, *mut c_void, *const Guid, *mut *mut c_void) -> i32, 0, 0, alloc, core::ptr::null_mut(), &IID_LIST, &mut list) < 0 {
+                release(alloc);
+                return;
+            }
+            let expected_croot = vslot(list, PC_SET_CROOT);
+            let expected_cconsts = vslot(list, PC_SET_CCONSTS);
+            let expected_cuav = vslot(list, PC_SET_CUAV);
+            let expected_resolve = vslot(list, PC_RESOLVE_QUERY);
+            let expected_pred = vslot(list, PC_SET_PREDICATION);
+            crate::cmdlist_wrap::apply(list);
+            assert_eq!(pc_list_slot(list, PC_SET_CROOT), expected_croot);
+            assert_eq!(pc_list_slot(list, PC_SET_CCONSTS), expected_cconsts);
+            assert_eq!(pc_list_slot(list, PC_SET_CUAV), expected_cuav);
+            assert_eq!(pc_list_slot(list, PC_RESOLVE_QUERY), expected_resolve);
+            assert_eq!(pc_list_slot(list, PC_SET_PREDICATION), expected_pred);
+            release(list);
+            release(alloc);
+        }
     }
 }
