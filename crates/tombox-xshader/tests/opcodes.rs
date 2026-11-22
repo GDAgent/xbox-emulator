@@ -669,3 +669,36 @@ fn flat_global_and_scratch_offsets_do_not_take_the_dlc_bit() {
         }
     }
 }
+
+fn vop3p(op: u32, vdst: u32, srcs: [u32; 3], opsel_hi: u32, neg: u32, clamp: bool) -> [u32; 2] {
+    [
+        0xcc00_0000 | (op << 16) | ((clamp as u32) << 15) | (((opsel_hi >> 2) & 1) << 14) | vdst,
+        srcs[0] | (srcs[1] << 9) | (srcs[2] << 18) | ((opsel_hi & 3) << 27) | (neg << 29),
+    ]
+}
+
+#[test]
+fn vop3p_int16_names_follow_the_rdna2_opcode_table() {
+    let names = [
+        "v_pk_mad_i16", "v_pk_mul_lo_u16", "v_pk_add_i16", "v_pk_sub_i16", "v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16",
+        "v_pk_max_i16", "v_pk_min_i16", "v_pk_mad_u16", "v_pk_add_u16", "v_pk_sub_u16", "v_pk_max_u16", "v_pk_min_u16",
+    ];
+    for (op, want) in names.iter().enumerate() {
+        let w = vop3p(op as u32, 4, [v(1), v(2), v(3)], 7, 0, false);
+        assert_eq!(mnemonic(&w).0, *want, "VOP3P opcode {op:#x}");
+        check(want, &program(&vop3p(op as u32, 0, [v(1), v(2), v(3)], 7, 0, false)), None, &[]);
+    }
+}
+
+#[test]
+fn vop3p_int16_refuses_modifiers_without_defined_integer_semantics() {
+    let err = |w: [u32; 2]| translate(&shader(&program(&w), None)).err().unwrap_or_default();
+    assert!(err(vop3p(0x0a, 0, [v(1), v(2), 0], 7, 0b010, false)).contains("NEG/NEG_HI on an integer packed op"));
+    assert!(err(vop3p(0x09, 0, [v(1), v(2), v(3)], 7, 0, true)).contains("CLAMP on an integer packed op"));
+    assert!(err(vop3p(0x01, 0, [v(1), v(2), 0], 7, 0, true)).contains("CLAMP on an integer packed op"));
+    assert!(err(vop3p(0x04, 0, [v(1), v(2), 0], 7, 0, true)).contains("CLAMP on an integer packed op"));
+    assert!(err(vop3p(0x0a, 0, [v(1), 242, 0], 7, 0, false)).contains("inline float constant"));
+    for op in [0x02, 0x03, 0x07, 0x0a, 0x0b, 0x0d] {
+        check("clamp", &program(&vop3p(op, 0, [v(1), v(2), 0], 7, 0, true)), None, &[]);
+    }
+}

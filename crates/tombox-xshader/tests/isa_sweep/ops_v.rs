@@ -958,6 +958,7 @@ fn vop3_ops(s: &mut Suite) {
         if ok { vec![Some(x.d[0]), Some(x.d[1]), Some(0)] } else { vec![None, None, None] }
     });
     vop3p_ops(s);
+    vop3p_int_ops(s);
 }
 
 fn pk_h(a: u32, sel_hi: bool, neg: bool) -> u32 {
@@ -1019,6 +1020,55 @@ fn vop3p_ops(s: &mut Suite) {
             });
         }
     }
+}
+
+fn vop3p_int_ops(s: &mut Suite) {
+    type P = fn(i64, i64, i64) -> i64;
+    let ops: &[(&'static str, u32, u32, bool, bool, P)] = &[
+        ("v_pk_mad_i16", 0x00, 3, true, false, |a, b, c| a * b + c),
+        ("v_pk_mul_lo_u16", 0x01, 2, false, false, |a, b, _| a * b),
+        ("v_pk_add_i16", 0x02, 2, true, true, |a, b, _| a + b),
+        ("v_pk_sub_i16", 0x03, 2, true, true, |a, b, _| a - b),
+        ("v_pk_lshlrev_b16", 0x04, 2, false, false, |a, b, _| b << (a & 15)),
+        ("v_pk_lshrrev_b16", 0x05, 2, false, false, |a, b, _| b >> (a & 15)),
+        ("v_pk_ashrrev_i16", 0x06, 2, true, false, |a, b, _| b >> (a & 15)),
+        ("v_pk_max_i16", 0x07, 2, true, true, |a, b, _| a.max(b)),
+        ("v_pk_min_i16", 0x08, 2, true, true, |a, b, _| a.min(b)),
+        ("v_pk_mad_u16", 0x09, 3, false, false, |a, b, c| a * b + c),
+        ("v_pk_add_u16", 0x0a, 2, false, true, |a, b, _| a + b),
+        ("v_pk_sub_u16", 0x0b, 2, false, true, |a, b, _| a - b),
+        ("v_pk_max_u16", 0x0c, 2, false, true, |a, b, _| a.max(b)),
+        ("v_pk_min_u16", 0x0d, 2, false, true, |a, b, _| a.min(b)),
+    ];
+    let mods: [(&str, u32, u32, bool); 4] = [("default", 0, 7, false), ("swap halves", 0b111, 0b000, false), ("mixed halves", 0b010, 0b101, false), ("clamp", 0, 7, true)];
+    for &(m, op, n, signed, clampable, g) in ops {
+        for &(name, opsel, opsel_hi, cl) in &mods {
+            if cl && !clampable {
+                continue;
+            }
+            let srcs = if n == 3 { [v(10), v(11), v(12)] } else { [v(10), v(11), 0] };
+            s.add(m, "VOP3P", name, Class::U32, &[], &vop3p(op, OUT, srcs, opsel, opsel_hi, 0, 0, cl), &[], &[Cmp::X], move |x| {
+                let half = |k: usize, hi: bool| -> i64 {
+                    let sel = if hi { (opsel_hi >> k) & 1 } else { (opsel >> k) & 1 } != 0;
+                    let u = if sel { x.d[k] >> 16 } else { x.d[k] & 0xffff };
+                    if signed { u as u16 as i16 as i64 } else { u as i64 }
+                };
+                let res = |hi: bool| -> u32 {
+                    let r = g(half(0, hi), half(1, hi), half(2, hi));
+                    let r = match (cl, signed) {
+                        (false, _) => r,
+                        (true, true) => r.clamp(-32768, 32767),
+                        (true, false) => r.clamp(0, 0xffff),
+                    };
+                    (r as u32) & 0xffff
+                };
+                o(res(false) | (res(true) << 16))
+            });
+        }
+    }
+    s.add("v_pk_add_u16", "VOP3P", "inline -1, op_sel_hi[1]=0", Class::U32, &[], &vop3p(0x0a, OUT, [v(10), 193, 0], 0, 0b001, 0, 0, false), &[], &[Cmp::X], |x| {
+        o((x.d[0].wrapping_sub(1) & 0xffff) | (((x.d[0] >> 16).wrapping_sub(1) & 0xffff) << 16))
+    });
 }
 
 pub fn add(s: &mut Suite) {
