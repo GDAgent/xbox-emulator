@@ -20,6 +20,7 @@ mod user_data;
 pub const R32G32B32A32_FLOAT: u32 = 2;
 pub const R32G32B32A32_UINT: u32 = 3;
 pub const R32G32B32A32_SINT: u32 = 4;
+pub const R32G32_UINT: u32 = 17;
 pub const R32_FLOAT: u32 = 41;
 pub const R32_UINT: u32 = 42;
 
@@ -35,7 +36,11 @@ pub struct Img {
 
 impl Img {
     fn bpp(&self) -> usize {
-        if self.fmt == R32_FLOAT || self.fmt == R32_UINT { 4 } else { 16 }
+        match self.fmt {
+            R32_FLOAT | R32_UINT => 4,
+            R32G32_UINT => 8,
+            _ => 16,
+        }
     }
     fn tex_desc(&self, uav: bool) -> [u8; 0x38] {
         let mut td = [0u8; 0x38];
@@ -403,6 +408,17 @@ pub struct MCase<'a> {
     pub tol: f32,
 }
 
+pub fn atomic_int64_on_typed_resource_supported() -> bool {
+    static SUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUP.get_or_init(|| {
+        let m = CTX.get_or_init(|| Mutex::new(unsafe { ctx_new() }));
+        let c = m.lock().unwrap_or_else(|e| e.into_inner());
+        let mut o9 = [0u32; 6];
+        let hr = unsafe { vcall!(c.gpu.device, 13, fn(u32, *mut u32, u32) -> i32, 37, o9.as_mut_ptr(), 24) };
+        hr >= 0 && o9[2] != 0
+    })
+}
+
 fn max_shader_model() -> u32 {
     static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
@@ -495,7 +511,9 @@ fn mem_device_features() {
         let hr14 = vcall!(c.gpu.device, 13, fn(u32, *mut u32, u32) -> i32, 43, o14.as_mut_ptr(), 12);
         let mut o1 = [0u32; 6];
         let hr1 = vcall!(c.gpu.device, 13, fn(u32, *mut u32, u32) -> i32, 8, o1.as_mut_ptr(), 24);
-        println!("shader model {:#x} (hr {hr:#x}); options14 {o14:?} (hr {hr14:#x}); options1 {o1:?} (hr {hr1:#x})", sm[0]);
+        let mut o9 = [0u32; 6];
+        let hr9 = vcall!(c.gpu.device, 13, fn(u32, *mut u32, u32) -> i32, 37, o9.as_mut_ptr(), 24);
+        println!("shader model {:#x} (hr {hr:#x}); options14 {o14:?} (hr {hr14:#x}); options1 {o1:?} (hr {hr1:#x}); options9 {o9:?} (hr {hr9:#x})", sm[0]);
     }
 }
 

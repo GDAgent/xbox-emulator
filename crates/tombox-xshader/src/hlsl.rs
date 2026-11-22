@@ -47,6 +47,7 @@ pub struct Translated {
     pub mip_srvs: Vec<u32>,
     pub needs_gmem: bool,
     pub needs_global: bool,
+    pub uses_typed_atomic64: bool,
     pub user_data_base: Option<usize>,
 }
 
@@ -421,6 +422,7 @@ struct Emitter<'a> {
     /// Image ops whose texture and/or sampler is one of several descriptors.
     /// UAV texture slots used with image atomics (declared `<uint>`).
     uav_uint: BTreeSet<u32>,
+    uav_u64: BTreeSet<u32>,
     /// The shader uses wave intrinsics (needs shader model 6: DXC only).
     uses_wave: bool,
     wave64: bool,
@@ -1128,6 +1130,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         d16: None,
         multi_sets: Vec::new(),
         uav_uint: BTreeSet::new(),
+        uav_u64: BTreeSet::new(),
         uses_wave: false,
         wave64,
         msel: HashMap::new(),
@@ -1222,6 +1225,10 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
     };
     let profile = match (em.sm6_minor, profile.split('_').next()) {
         (0, _) => profile,
+        (6, Some("ps")) => "ps_6_6",
+        (6, Some("vs")) => "vs_6_6",
+        (6, Some("cs")) => "cs_6_6",
+        (6, Some("gs")) => "gs_6_6",
         (7, Some("ps")) => "ps_6_7",
         (7, Some("vs")) => "vs_6_7",
         (7, Some("cs")) => "cs_6_7",
@@ -1236,7 +1243,7 @@ fn translate_with(ex: &ShaderExtract, out_interp: &InputInterp, user_base_overri
         (_, Some("ms")) => "ms_6_8",
         _ => profile,
     };
-    Ok(Translated { hlsl, entry: "main", profile, mip_uavs: em.uav_mips.iter().copied().collect(), mip_srvs: em.tex_mips.iter().copied().collect(), needs_gmem: em.uses_bvh, needs_global: em.uses_global, user_data_base: em.ud_active().then(|| em.user_base()) })
+    Ok(Translated { hlsl, entry: "main", profile, mip_uavs: em.uav_mips.iter().copied().collect(), mip_srvs: em.tex_mips.iter().copied().collect(), needs_gmem: em.uses_bvh, needs_global: em.uses_global, uses_typed_atomic64: !em.uav_u64.is_empty(), user_data_base: em.ud_active().then(|| em.user_base()) })
 }
 
 impl<'a> Emitter<'a> {
@@ -1844,7 +1851,7 @@ impl<'a> Emitter<'a> {
                 self.tbuf_ty.insert((is_uav, slot), t);
             } else if is_uav {
                 // Textures used with image atomics already have their own uint declaration.
-                if !self.uav_uint.contains(&slot) {
+                if !self.uav_uint.contains(&slot) && !self.uav_u64.contains(&slot) {
                     self.img_ty.insert((true, slot), t);
                 }
             } else if !sampled.contains(&slot) {
@@ -2367,7 +2374,13 @@ impl<'a> Emitter<'a> {
                             if is_uav { self.bl_uav.insert(tslot); } else { self.bl_srv.insert(tslot); }
                         }
                         if is_uav && ins.mnemonic.starts_with("image_atomic_") {
-                            self.uav_uint.insert(tslot);
+                            let op = &ins.mnemonic["image_atomic_".len()..];
+                            let is_64 = (op == "cmpswap" && ins.aux.mask == 0xf) || (op != "cmpswap" && ins.aux.mask == 0x3);
+                            if is_64 {
+                                self.uav_u64.insert(tslot);
+                            } else {
+                                self.uav_uint.insert(tslot);
+                            }
                         }
                         let map = if is_uav { &mut self.uav } else { &mut self.tex };
                         if let Some(prev) = map.insert(tslot, dim) {
@@ -5855,6 +5868,10 @@ impl<'a> Emitter<'a> {
                 _ => return Err("bad vdata".into()),
             };
             let as_uint = is_uav && self.uav_uint.contains(&slot);
+            let as_u64 = is_uav && self.uav_u64.contains(&slot);
+            if as_uint && as_u64 {
+                return Err("image slot mixes 32-bit and 64-bit image atomics".into());
+            }
             let uobj = if is_uav && with_mip {
                 if slot & BINDLESS != 0 {
                     return Err(format!("{} on a bindless UAV: per-mip views need a heap-mirrored descriptor range", ins.mnemonic));
@@ -5874,19 +5891,78 @@ impl<'a> Emitter<'a> {
                 return Err("D16 access to an image also used with image atomics unsupported (texel signedness unknown)".into());
             }
             if let Some(op) = ins.mnemonic.strip_prefix("image_atomic_") {
-                if !as_uint {
+                if !as_uint && !as_u64 {
                     return Err("image atomic on a non-UAV table".into());
+                }
+                let glc = ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0);
+                if as_u64 {
+                    let dmask_64 = if op == "cmpswap" { 0xf } else { 0x3 };
+                    if ins.aux.mask != dmask_64 {
+                        return Err(format!("{} with dmask {:#x}: unsupported 64-bit image atomic dmask", ins.mnemonic, ins.aux.mask));
+                    }
+                    self.sm6_minor = self.sm6_minor.max(6);
+                    self.touch(&Opnd::Vgpr(vd));
+                    self.touch(&Opnd::Vgpr(vd + 1));
+                    let v64 = format!("(((uint64_t)v{} << 32) | (uint64_t)v{vd})", vd + 1);
+                    let addr = format!("{uobj}[uint{ncoord}({})]", c.join(", "));
+                    let t = self.tmp;
+                    self.tmp += 1;
+                    self.line(&format!("uint64_t t{t} = 0;"));
+                    let call = match op {
+                        "swap" => format!("InterlockedExchange({addr}, {v64}, t{t});"),
+                        "add" => format!("InterlockedAdd({addr}, {v64}, t{t});"),
+                        "sub" => format!("InterlockedAdd({addr}, (uint64_t)0 - ({v64}), t{t});"),
+                        "umin" => format!("InterlockedMin({addr}, {v64}, t{t});"),
+                        "umax" => format!("InterlockedMax({addr}, {v64}, t{t});"),
+                        "and" => format!("InterlockedAnd({addr}, {v64}, t{t});"),
+                        "or" => format!("InterlockedOr({addr}, {v64}, t{t});"),
+                        "xor" => format!("InterlockedXor({addr}, {v64}, t{t});"),
+                        "cmpswap" => {
+                            self.touch(&Opnd::Vgpr(vd + 2));
+                            self.touch(&Opnd::Vgpr(vd + 3));
+                            let cmp64 = format!("(((uint64_t)v{} << 32) | (uint64_t)v{})", vd + 3, vd + 2);
+                            format!("InterlockedCompareExchange({addr}, {cmp64}, {v64}, t{t});")
+                        }
+                        _ => return Err(format!("64-bit image atomic {op} unsupported")),
+                    };
+                    self.line(&format!("if (exec_lo & 1u) {call}"));
+                    if glc {
+                        self.wv(&Opnd::Vgpr(vd), &format!("(uint)t{t}"))?;
+                        self.wv(&Opnd::Vgpr(vd + 1), &format!("(uint)(t{t} >> 32)"))?;
+                    }
+                    return Ok(());
                 }
                 let dmask_32 = if op == "cmpswap" { 0x3 } else { 0x1 };
                 if ins.aux.mask != dmask_32 {
-                    return Err(format!("{} with dmask {:#x}: only 32-bit image atomics are supported", ins.mnemonic, ins.aux.mask));
+                    return Err(format!("{} with dmask {:#x}: only 32-bit and 64-bit image atomics are supported", ins.mnemonic, ins.aux.mask));
                 }
-                let glc = ins.raw.first().is_some_and(|w| (w >> 13) & 1 != 0);
                 let o = Opnd::Vgpr(vd);
                 let old = self.atomic_rmw(op, &format!("{uobj}[uint{ncoord}({})]", c.join(", ")), o)?;
                 if glc {
                     self.wv(&o, &old)?;
                 }
+                return Ok(());
+            }
+            if store && as_u64 {
+                if ins.aux.mask != 0x3 {
+                    return Err(format!("image_store with dmask {:#x} on a 64-bit atomic UAV image unsupported", ins.aux.mask));
+                }
+                self.sm6_minor = self.sm6_minor.max(6);
+                self.touch(&Opnd::Vgpr(vd));
+                self.touch(&Opnd::Vgpr(vd + 1));
+                self.line(&format!("if (exec_lo & 1u) {uobj}[uint{ncoord}({})] = (((uint64_t)v{} << 32) | (uint64_t)v{vd});", c.join(", "), vd + 1));
+                return Ok(());
+            }
+            if !store && as_u64 {
+                if ins.aux.mask != 0x3 {
+                    return Err(format!("image_load with dmask {:#x} on a 64-bit atomic UAV image unsupported", ins.aux.mask));
+                }
+                self.sm6_minor = self.sm6_minor.max(6);
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("uint64_t t{t} = {uobj}[uint{ncoord}({})];", c.join(", ")));
+                self.wv(&Opnd::Vgpr(vd), &format!("(uint)t{t}"))?;
+                self.wv(&Opnd::Vgpr(vd + 1), &format!("(uint)(t{t} >> 32)"))?;
                 return Ok(());
             }
             if store && as_uint {
@@ -6671,17 +6747,19 @@ impl<'a> Emitter<'a> {
                 Some(_) => "uint4",
                 None => "float4",
             };
-            let ty = match (dim, self.uav_uint.contains(slot)) {
-                (0, false) => format!("RWTexture1D<{e}>"),
-                (4, false) => format!("RWTexture1DArray<{e}>"),
-                (1, false) => format!("RWTexture2D<{e}>"),
-                (2, false) => format!("RWTexture3D<{e}>"),
-                (5, false) => format!("RWTexture2DArray<{e}>"),
-                (0, true) => "RWTexture1D<uint>".to_string(),
-                (4, true) => "RWTexture1DArray<uint>".to_string(),
-                (1, true) => "RWTexture2D<uint>".to_string(),
-                (2, true) => "RWTexture3D<uint>".to_string(),
-                (5, true) => "RWTexture2DArray<uint>".to_string(),
+            let elem = if self.uav_u64.contains(slot) {
+                "uint64_t"
+            } else if self.uav_uint.contains(slot) {
+                "uint"
+            } else {
+                e
+            };
+            let ty = match dim {
+                0 => format!("RWTexture1D<{elem}>"),
+                4 => format!("RWTexture1DArray<{elem}>"),
+                1 => format!("RWTexture2D<{elem}>"),
+                2 => format!("RWTexture3D<{elem}>"),
+                5 => format!("RWTexture2DArray<{elem}>"),
                 _ => return Err(format!("UAV dim {dim} unsupported")),
             };
             h.push_str(&self.decl(&mut used, &ty, &format!("uav{slot}"), *slot, 'u', 1, 32)?);

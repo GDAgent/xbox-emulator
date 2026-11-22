@@ -2084,6 +2084,9 @@ pub(crate) fn vtable() -> *const usize {
 
 /// Wrap a real `ID3D12Device` so we can intercept QueryInterface.
 pub fn wrap_device(real: *mut c_void) -> *mut c_void {
+    if !real.is_null() {
+        unsafe { crate::shader_xlat::probe_typed_atomic64(real) };
+    }
     if crate::rtcap::enabled() && !real.is_null() {
         unsafe { patch_real_device(real) };
     }

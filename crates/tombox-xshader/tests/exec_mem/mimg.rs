@@ -409,6 +409,87 @@ fn image_mimg_atomics() {
     run_mem_cases("mimg_atomics", &cs);
 }
 
+const AT64_INIT: [u64; 8] = [
+    0x0000_0001_ffff_fffe,
+    0x1234_5678_9abc_def0,
+    0x8000_0000_0000_0001,
+    0xffff_ffff_ffff_ffff,
+    0x0000_0000_0000_0020,
+    0x0000_0000_0000_0000,
+    0x7fff_ffff_ffff_fffe,
+    0xfeed_face_cafe_babe,
+];
+
+fn tat64(_m: u32, _l: u32, x: u32, y: u32) -> [u32; 4] {
+    let v = if y == 0 { AT64_INIT[x as usize] } else { 0x0bad_0000_0000_0000 | ((y as u64) * 8 + x as u64) };
+    [v as u32, (v >> 32) as u32, 0, 0]
+}
+
+const IMG_AT64: Img = Img { w: 8, h: 8, layers: 1, array: false, mips: 1, fmt: R32G32_UINT, texel: tat64 };
+
+#[test]
+fn image_mimg_atomics_64bit() {
+    if !atomic_int64_on_typed_resource_supported() {
+        println!("SKIP image_mimg_atomics_64bit: AtomicInt64OnTypedResourceSupported is false on this device");
+        return;
+    }
+    type At64 = fn(u64, u64, u64) -> u64;
+    let atoms: [(&'static str, u32, At64); 9] = [
+        ("image_atomic_swap", 0x0f, |_, s, _| s),
+        ("image_atomic_cmpswap", 0x10, |m, s, c| if m == c { s } else { m }),
+        ("image_atomic_add", 0x11, |m, s, _| m.wrapping_add(s)),
+        ("image_atomic_sub", 0x12, |m, s, _| m.wrapping_sub(s)),
+        ("image_atomic_umin", 0x15, |m, s, _| m.min(s)),
+        ("image_atomic_umax", 0x17, |m, s, _| m.max(s)),
+        ("image_atomic_and", 0x18, |m, s, _| m & s),
+        ("image_atomic_or", 0x19, |m, s, _| m | s),
+        ("image_atomic_xor", 0x1a, |m, s, _| m ^ s),
+    ];
+    let inputs: [(u32, u64, u64); 6] = [
+        (0, 0x0000_0000_0000_0005, 0x0000_0001_ffff_fffe),
+        (1, 0x0000_0002_1111_2222, 0x1234_5678_0000_def0),
+        (2, 0x8000_0000_0000_0002, 0x8000_0000_0000_0001),
+        (3, 0x0000_0000_0000_0007, 0xffff_ffff_ffff_ffff),
+        (4, 0x0000_0003_0000_0010, 0x0000_0001_0000_0020),
+        (6, 0x7fff_ffff_ffff_ffff, 0x7fff_ffff_ffff_fffe),
+    ];
+    let mut cs = Vec::new();
+    for (m, opc, f) in atoms {
+        let dmask = if opc == 0x10 { 0xf } else { 0x3 };
+        for &(x, s, cmp) in &inputs {
+            let old = AT64_INIT[x as usize];
+            let newv = f(old, s, cmp);
+            let mut pre = Prog::new();
+            pre.vv(1, x)
+                .vv(2, 0)
+                .vv(4, s as u32)
+                .vv(5, (s >> 32) as u32)
+                .vv(6, cmp as u32)
+                .vv(7, (cmp >> 32) as u32);
+            let nbr = AT64_INIT[(x ^ 1) as usize];
+            let below = 0x0bad_0000_0000_0000u64 | (8 + x as u64);
+            let uav = vec![
+                (0usize, (x as usize) * 2, newv as u32),
+                (0, (x as usize) * 2 + 1, (newv >> 32) as u32),
+                (0, ((x ^ 1) as usize) * 2, nbr as u32),
+                (0, ((x ^ 1) as usize) * 2 + 1, (nbr >> 32) as u32),
+                (0, (8 + x as usize) * 2, below as u32),
+                (0, (8 + x as usize) * 2 + 1, (below >> 32) as u32),
+            ];
+            for glc in [true, false] {
+                let mut op = mimg(opc, dmask, 1, 1, 4, 16, 0);
+                if glc {
+                    op[0] |= 1 << 13;
+                }
+                let rv = if glc { old } else { s };
+                let rt = vec![rv as u32, (rv >> 32) as u32];
+                cs.push(MCase { m, op: op.to_vec(), words: build(&pre, &op, 4, 2, true), env: Env { uav: Some(&IMG_AT64), ..Default::default() }, rt, uav: uav.clone(), tol: 0.0 });
+            }
+        }
+    }
+    run_mem_cases("mimg_atomics_64bit", &cs);
+}
+
 fn tu4(_m: u32, _l: u32, x: u32, y: u32) -> [u32; 4] {
     match (x, y) {
         (0, 0) => [0x0000_1234, 0x0001_0000, 0xffff_ffff, 0x0000_0000],
