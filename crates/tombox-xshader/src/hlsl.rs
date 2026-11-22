@@ -6265,8 +6265,8 @@ impl<'a> Emitter<'a> {
         };
         if gather {
             // gather4: dmask picks the channel; the four texels fill vdata..vdata+3.
-            if !matches!(modi, 0 | 7) {
-                return Err("gather4 with explicit LOD/bias unsupported".into());
+            if !matches!(modi, 0 | 4 | 7) {
+                return Err("gather4 with LOD bias or clamp unsupported".into());
             }
             let chan = match ins.aux.mask {
                 1 => "Red",
@@ -6275,6 +6275,40 @@ impl<'a> Emitter<'a> {
                 8 => "Alpha",
                 m => return Err(format!("gather4 with dmask {m:#x} unsupported")),
             };
+            if modi == 4 {
+                if !matches!(dim, 1 | 5) {
+                    return Err(format!("{} on image dim {dim} unsupported", ins.mnemonic));
+                }
+                if unorm {
+                    return Err(format!("{} with unnormalised coordinates unsupported", ins.mnemonic));
+                }
+                let l = lod.clone().ok_or("missing lod")?;
+                let k = XYZW[ins.aux.mask.trailing_zeros() as usize];
+                let ext = if dim == 5 { format!("t{t}e, ") } else { String::new() };
+                self.line(&format!("uint t{t}w, t{t}h, t{t}e, t{t}n;"));
+                self.line(&format!("{tex}.GetDimensions(0u, t{t}w, t{t}h, {ext}t{t}n);"));
+                self.line(&format!("float t{t}l = {l};"));
+                self.line(&format!("uint t{t}m = min(t{t}l > 0.5 ? (uint)(ceil(min(t{t}l, 16.0) + 0.5) - 1.0) : 0u, t{t}n - 1u);"));
+                self.line(&format!("{tex}.GetDimensions(t{t}m, t{t}w, t{t}h, {ext}t{t}n);"));
+                self.line(&format!("float2 t{t}s = float2(t{t}w, t{t}h);"));
+                let o = offset.map(|o| format!(" + {o}")).unwrap_or_default();
+                self.line(&format!("int2 t{t}i = int2(floor(float2({}, {}) * t{t}s - 0.5)){o};", coords[0], coords[1]));
+                if zref.is_some() {
+                    self.sm6_minor = self.sm6_minor.max(7);
+                }
+                let mut vals = Vec::new();
+                for (n, (dx, dy)) in [(0, 1), (1, 1), (1, 0), (0, 0)].into_iter().enumerate() {
+                    let c = format!("(float2(t{t}i + int2({dx}, {dy})) + 0.5) / t{t}s");
+                    let c = if dim == 5 { format!("float3({c}, {})", coords[2]) } else { c };
+                    let call = match &zref {
+                        Some(z) => format!("{tex}.SampleCmpLevel({smp}, {c}, {z}, (float)t{t}m)"),
+                        None => format!("{tex}.SampleLevel({smp}, {c}, (float)t{t}m).{k}"),
+                    };
+                    self.line(&format!("float t{t}g{n} = {call};"));
+                    vals.push(format!("asuint(t{t}g{n})"));
+                }
+                return self.mimg_write_lanes(ins, vd, vals, Lane::Float);
+            }
             let off = offset.map(|o| format!(", {o}")).unwrap_or_default();
             let gtex = if modi == 0 {
                 if self.ex.stage != Stage::Pixel {

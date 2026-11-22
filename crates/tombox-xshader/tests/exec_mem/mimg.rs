@@ -244,6 +244,72 @@ fn image_mimg_compare_gather() {
     run_mem_cases("mimg_compare_gather", &cs);
 }
 
+fn foot_at(m: u32, u: f32, v: f32, off: (i32, i32), wrap: bool) -> [(u32, u32); 4] {
+    let s = (8u32 >> m) as i32;
+    let i0 = (u * s as f32 - 0.5).floor() as i32 + off.0;
+    let j0 = (v * s as f32 - 0.5).floor() as i32 + off.1;
+    let c = |a: i32| if wrap { a.rem_euclid(s) as u32 } else { a.clamp(0, s - 1) as u32 };
+    [(c(i0), c(j0 + 1)), (c(i0 + 1), c(j0 + 1)), (c(i0 + 1), c(j0)), (c(i0), c(j0))]
+}
+
+#[test]
+fn image_mimg_gather_explicit_lod() {
+    let mut cs = Vec::new();
+    let (gu, gv) = (0.3f32, 0.55f32);
+    for &(lod, dmask) in &[(0.0f32, 1u32), (0.5, 2), (0.6, 4), (1.5, 8), (2.2, 1), (9.0, 2), (-2.0, 8), (1.0, 1)] {
+        let ch = dmask.trailing_zeros() as usize;
+        let op = mimg(0x44, dmask, 1, 1, 8, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(1, fb(gu)).vv(2, fb(gv)).vv(3, fb(lod));
+        let m = nearest(lod, 4);
+        let exp: Vec<u32> = foot_at(m, gu, gv, (0, 0), false).iter().map(|&(x, y)| ea(m, x, y)[ch]).collect();
+        cs.push(case("image_gather4_l", op, build(&pre, &op, 8, 4, false), Env { tex: Some(&IMG_A), samp: ptsamp(), ..Default::default() }, exp));
+    }
+    for &(u, v, lod, filt) in &[(0.05f32, 0.9f32, 1.0f32, 0u32), (0.97, 0.02, 0.0, 0), (0.05, 0.9, 1.0, 0x15), (0.4, 0.6, 2.0, 0x15)] {
+        let op = mimg(0x44, 1, 1, 1, 8, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(1, fb(u)).vv(2, fb(v)).vv(3, fb(lod));
+        let m = nearest(lod, 4);
+        let exp: Vec<u32> = foot_at(m, u, v, (0, 0), true).iter().map(|&(x, y)| ea(m, x, y)[0]).collect();
+        cs.push(case("image_gather4_l", op, build(&pre, &op, 8, 4, false), Env { tex: Some(&IMG_A), samp: Some(sampler(filt, 1, 0)), ..Default::default() }, exp));
+    }
+    for &(ox, oy, lod) in &[(1i32, -1i32, 0.0f32), (-2, 3, 1.0), (5, 0, 0.0), (-8, 7, 2.0)] {
+        let op = mimg(0x54, 2, 1, 1, 8, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(1, packoff(ox, oy)).vv(2, fb(gu)).vv(3, fb(gv)).vv(4, fb(lod));
+        let m = nearest(lod, 4);
+        let exp: Vec<u32> = foot_at(m, gu, gv, (ox, oy), false).iter().map(|&(x, y)| ea(m, x, y)[1]).collect();
+        cs.push(case("image_gather4_l_o", op, build(&pre, &op, 8, 4, false), Env { tex: Some(&IMG_A), samp: ptsamp(), ..Default::default() }, exp));
+    }
+    for &(layer, lod) in &[(0.0f32, 0.0f32), (2.0, 1.0), (1.0, 3.0)] {
+        let op = mimg(0x44, 4, 5, 1, 8, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(1, fb(gu)).vv(2, fb(gv)).vv(3, fb(layer)).vv(4, fb(lod));
+        let m = nearest(lod, 2);
+        let exp: Vec<u32> = foot_at(m, gu, gv, (0, 0), false).iter().map(|&(x, y)| ea(m, x, y)[2]).collect();
+        cs.push(case("image_gather4_l", op, build(&pre, &op, 8, 4, false), Env { tex: Some(&IMG_C), samp: ptsamp(), ..Default::default() }, exp));
+    }
+    let one = |b: bool| fb(if b { 1.0 } else { 0.0 });
+    for &(f, z, lod) in &[(2u32, 0.5f32 + 6.5 / 64.0, 1.0f32), (5, 30.5 / 64.0, 0.0), (2, 0.5 + 1.5 / 64.0, 0.7), (4, 27.0 / 64.0, 0.2)] {
+        let op = mimg(0x4c, 1, 1, 1, 8, 0, 12);
+        let mut pre = Prog::new();
+        pre.vv(1, fb(z)).vv(2, fb(gu)).vv(3, fb(gv)).vv(4, fb(lod));
+        let m = nearest(lod, 2);
+        let t = |x: u32, y: u32| f32::from_bits(td(m, 0, x, y)[0]);
+        let exp: Vec<u32> = foot_at(m, gu, gv, (0, 0), false)
+            .iter()
+            .map(|&(x, y)| one(match f {
+                2 => z < t(x, y),
+                4 => z <= t(x, y),
+                5 => z > t(x, y),
+                _ => unreachable!(),
+            }))
+            .collect();
+        cs.push(case("image_gather4_c_l", op, build(&pre, &op, 8, 4, false), Env { tex: Some(&IMG_E), samp: Some(sampler(0x80, 3, f)), ..Default::default() }, exp));
+    }
+    run_mem_cases("mimg_gather_explicit_lod", &cs);
+}
+
 #[test]
 fn image_mimg_query() {
     let mut cs = Vec::new();
