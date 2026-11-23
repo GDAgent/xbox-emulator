@@ -7,6 +7,7 @@ mod branch;
 mod cfg_fuzz;
 mod ds;
 mod gds;
+mod mubuf_inv;
 mod exp;
 mod flat;
 mod global;
