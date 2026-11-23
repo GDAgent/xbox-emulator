@@ -143,3 +143,19 @@ fn table_types_the_descriptor_as_written_or_read() {
     assert!(t.hlsl.contains("register(t1)"), "{}", t.hlsl);
     compile("FSSM UAV + SRV", &t.hlsl, t.profile);
 }
+
+#[test]
+fn buffer_elements_take_the_fssm_stride() {
+    let f = fssm(9, &[[3, 0, 1, 0, 8]], &[[0x300, 0, 0, 44, 0x0804], [0x300, 8, 1, 0, 0x0808]]);
+    let t = translate_with_fssm_root(&pixel_shader(&program(), f)).unwrap_or_else(|e| panic!("{e}"));
+    assert!(t.hlsl.contains("struct TbElem_sbuf0 { uint w[11]; };"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("/ 11u].w["), "{}", t.hlsl);
+    compile("stride 44", &t.hlsl, t.profile);
+}
+
+#[test]
+fn conflicting_fssm_strides_keep_the_extent_heuristic() {
+    let f = fssm(9, &[[3, 0, 1, 0, 8]], &[[0x300, 0, 0, 44, 0x0804], [0x300, 0, 0, 32, 0x0804], [0x300, 8, 1, 0, 0x0808]]);
+    let t = translate_with_fssm_root(&pixel_shader(&program(), f)).unwrap_or_else(|e| panic!("{e}"));
+    assert!(t.hlsl.contains("struct TbElem_sbuf0 { uint w[1]; };"), "{}", t.hlsl);
+}
