@@ -18,6 +18,7 @@ mod trans16;
 mod trans32;
 mod rootmem;
 mod smem_nr;
+mod sop1_dst;
 mod user_data;
 
 pub const R32G32B32A32_FLOAT: u32 = 2;

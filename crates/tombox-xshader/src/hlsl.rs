@@ -368,6 +368,10 @@ fn sreg_opnd(n: u8) -> Opnd {
     }
 }
 
+pub(super) fn i32_result_of_64(m: &str) -> bool {
+    m.starts_with("s_") && m.contains("_i32_") && (m.ends_with("_b64") || m.ends_with("_i64"))
+}
+
 /// High half of a 64-bit scalar operand.
 fn hi(o: &Opnd) -> Opnd {
     match o {
@@ -1523,7 +1527,7 @@ impl<'a> Emitter<'a> {
     fn sgpr_const_in(insns: &[Insn], start: usize, idx: usize, reg: u8) -> Option<u32> {
         for j in (start..idx).rev() {
             let i = &insns[j];
-            let wide = if i.enc == Enc::Smem && i.op <= 4 { 1u16 << i.op } else if i.mnemonic.ends_with("_b64") || i.mnemonic.ends_with("_u64") || i.mnemonic.ends_with("_i64") { 2 } else { 1 };
+            let wide = if i.enc == Enc::Smem && i.op <= 4 { 1u16 << i.op } else if (i.mnemonic.ends_with("_b64") || i.mnemonic.ends_with("_u64") || i.mnemonic.ends_with("_i64")) && !i32_result_of_64(&i.mnemonic) { 2 } else { 1 };
             let hit = i.dst.iter().any(|d| matches!(d, Opnd::Sgpr(r) if (reg as u16) >= *r as u16 && (reg as u16) < *r as u16 + wide));
             if !hit {
                 continue;
@@ -2579,7 +2583,7 @@ impl<'a> Emitter<'a> {
                         if let Some(n) = sg(d) {
                             sym.remove(&n);
                             written.insert(n);
-                            if ins.mnemonic.ends_with("_b64") {
+                            if ins.mnemonic.ends_with("_b64") && !i32_result_of_64(&ins.mnemonic) {
                                 sym.remove(&(n + 1));
                                 written.insert(n + 1);
                             }
@@ -2624,7 +2628,7 @@ impl<'a> Emitter<'a> {
                 Enc::Smem if matches!(ins.op, 0x24 | 0x25) => 1,
                 Enc::Smem => (1u32 << (ins.op & 7)) - 1,
                 Enc::Mimg => mimg_data_regs(ins).saturating_sub(1),
-                _ if ins.mnemonic.ends_with("_b64") => 1,
+                _ if ins.mnemonic.ends_with("_b64") && !i32_result_of_64(&ins.mnemonic) => 1,
                 _ => 0,
             };
             for o in &ins.dst {
@@ -3740,6 +3744,7 @@ impl<'a> Emitter<'a> {
                         // Population count of a 64-bit value — typically the number of active
                         // lanes (wave-level allocation). One invocation = one lane, so a lane
                         // mask counts as 0 or 1.
+                        self.touch(&hi(&s[0]));
                         let ah = r(&hi(&s[0]))?;
                         self.ws(&d, &format!("(countbits({a}) + countbits({ah}))"))?;
                         self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
