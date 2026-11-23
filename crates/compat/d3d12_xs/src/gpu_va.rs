@@ -22,6 +22,7 @@ struct Tables {
     width: HashMap<usize, u64>,
     owned: HashMap<usize, HashSet<(bool, u64)>>,
     watched: HashSet<usize>,
+    uav_buffers: HashSet<usize>,
 }
 
 static T: Mutex<Option<Tables>> = Mutex::new(None);
@@ -29,7 +30,7 @@ static NEXT_SYNTH: AtomicU64 = AtomicU64::new(SYNTHETIC_TEXTURE_BASE);
 
 fn with<R>(f: impl FnOnce(&mut Tables) -> R) -> R {
     let mut g = T.lock().unwrap_or_else(|e| e.into_inner());
-    let t = g.get_or_insert_with(|| Tables { ranges: Vec::new(), cpu: Vec::new(), texture_va: HashMap::new(), state: HashMap::new(), width: HashMap::new(), owned: HashMap::new(), watched: HashSet::new() });
+    let t = g.get_or_insert_with(|| Tables { ranges: Vec::new(), cpu: Vec::new(), texture_va: HashMap::new(), state: HashMap::new(), width: HashMap::new(), owned: HashMap::new(), watched: HashSet::new(), uav_buffers: HashSet::new() });
     f(t)
 }
 
@@ -47,6 +48,7 @@ pub fn forget(res: usize) {
         t.state.remove(&res);
         t.width.remove(&res);
         t.watched.remove(&res);
+        t.uav_buffers.remove(&res);
     });
 }
 
@@ -201,6 +203,17 @@ pub fn lookup_buffer(va: u64) -> Option<(Entry, u64)> {
 
 pub fn lookup_gpu(va: u64) -> Option<(Entry, u64)> {
     with(|t| find_in(&t.ranges, va))
+}
+
+pub fn snapshot_buffers() -> Vec<(Entry, bool)> {
+    with(|t| {
+        t.ranges
+            .iter()
+            .flat_map(|m| m.values())
+            .filter(|e| e.buffer && e.len >= 4 && e.res != 0)
+            .map(|&e| (e, t.uav_buffers.contains(&e.res)))
+            .collect()
+    })
 }
 
 pub fn set_state(res: usize, state: u32) {
@@ -434,7 +447,16 @@ pub unsafe fn note_resource(real_device: *mut c_void, res: *mut c_void, desc: &[
     let real_get: unsafe extern "system" fn(*mut c_void) -> u64 = unsafe { core::mem::transmute(*rvt.add(RESOURCE_GET_GPU_VA)) };
     if buffer {
         let width = u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap());
-        with(|t| { t.width.insert(res as usize, width); });
+        let flags = u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap());
+        let allow_uav = flags & 0x4 != 0;
+        with(|t| {
+            t.width.insert(res as usize, width);
+            if allow_uav {
+                t.uav_buffers.insert(res as usize);
+            } else {
+                t.uav_buffers.remove(&(res as usize));
+            }
+        });
         unsafe { ensure_patched(res) };
         let pc_va = unsafe { real_get(res) };
         let pc_va = if pc_va == 0 || real_get as usize == get_gpu_va_x as usize { pc_va } else { pc_va + crate::placed_offset::bytes(res as usize) };
